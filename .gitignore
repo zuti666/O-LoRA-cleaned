@@ -48,6 +48,8 @@ output/
 results/
 runs/
 CL_Benchmark/
+data/
+
 
 # 日志目录及变体
 # 忽略 logs_and_outputs 及所有变体和内容
