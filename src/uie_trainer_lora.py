@@ -13,6 +13,7 @@ import h5py
 import copy
 from datetime import datetime 
 from torch.nn import functional as F
+import json
 
 def skip_instructions(model, predictions_ids, tokenizer, ignore_idx=-100):
     predictions_ids = np.where(predictions_ids == ignore_idx, tokenizer.pad_token_id, predictions_ids)
@@ -63,29 +64,371 @@ class UIETrainer(Seq2SeqTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+        # logger.debug("UIETrainer args: %r", args)
+        # logger.debug("UIETrainer kwargs: %r", kwargs)
 
-        if getattr(self.args, "use_probe", False):
+        # 当 使用 rwp 来生成扰动
+        # if self.args.rwp_type != '':
+        rwp_type = getattr(self.args, "rwp_type", "")
+        logger.debug(f"rwp_type: {rwp_type}")
+        if rwp_type != "":
+            rwp_noise_type = getattr(self.args, "rwp_noise_type", "")
+            noise_std= getattr(self.args, "noise_std", 1)
+            if "fisher" in rwp_noise_type:
+                self.fisher_dict = {}
+                for name, param in self.model.named_parameters():
+                    self.fisher_dict[name] = torch.zeros_like(param)
+            logger.debug(f"rwp_noise_type: {rwp_noise_type}; noise_std:{noise_std}")
+
+
+        use_probe = getattr(self.args, "train_method", "")
+        if  use_probe == "use_probe":
             # 尝试寻找 probe_head
-            self.probe_head = getattr(self.model, "probe_head", None)
-            if self.probe_head is None and hasattr(self.model, "base_model") and hasattr(self.model.base_model, "model"):
-                self.probe_head = getattr(self.model.base_model.model, "probe_head", None)
-            if self.probe_head is None:
-                raise ValueError("Model does not have `probe_head` defined.")
+            probe_num_classes = getattr(self.args, "probe_num_classes", "")
+            probe_feature_mode = getattr(self.args, "probe_feature_model", "")
+            logger.info(f"use_probe, probe_num_classes: {probe_num_classes}; probe_feature_mode:{probe_feature_mode}")
 
-            logger.info(f"Found probe head: {self.probe_head}")
 
-        # if getattr(self.args, "use_probe", False):
-        #     logger.info(f"Adding probe head in Trainer init")
-        #     num_probe_classes = self.args.probe_num_classes
-        #     hidden_size = self.model.config.hidden_size
-        #     self.model.probe_head = nn.Linear(hidden_size, num_probe_classes)
-        #     self.model.probe_head.to(self.args.device)  # 🔥 关键修复！把分类头移动到GPU
 
-        #     # 冻结其他参数
-        #     for name, param in self.model.named_parameters():
-        #         if not name.startswith("probe_head"):
-        #             param.requires_grad = False
 
+    # def _run_rwp_step(self, model, inputs, noise_range="lora", use_ddp=False):
+        
+    #     # 设置累积次数为2之后，第一次计算的结果就是原来在第一，第二个batch的损失的累积（g_batch1和 g_batch2）
+
+    #     # Step 2: g₁ - 添加扰动，重新计算梯度 这里实际上只给第二个batch添加了扰动 g_batch2,然后进行混合的话
+
+    #     #  lammda_1（g_batch1+ g_batch2） + (1 - lammda_1) * (g_batch2+noise)
+
+    #     # g0 = self._gather_grad_vector(model)
+
+    #     # # Step 2: g₁ - 添加扰动并计算噪声梯度
+    #     # # === Step 2: g₁ ===
+    #     # disable_running_stats(model)
+    #     # noise_list = []
+
+    #     # with torch.no_grad():
+    #     #     for name, param in model.named_parameters():
+    #     #         # === 根据噪声注入范围决定是否处理当前参数 ===
+    #     #         if noise_range == "lora":
+    #     #             if param.requires_grad and "loranew_" in name:
+    #     #                 noise = torch.randn_like(param) * self.args.sigma
+    #     #                 param.data.add_(noise)
+    #     #                 noise_list.append((param, noise))
+
+    #     #                 logger.debug(f"[RWP] Injected noise into: {name} | shape: {param.shape}")
+
+
+    #     #         elif noise_range == "full":
+    #     #             noise = torch.randn_like(param) * self.args.sigma
+    #     #             param.data.add_(noise)
+    #     #             noise_list.append((param, noise))
+
+    #     #             logger.debug(f"[RWP] Injected noise into: {name} | shape: {param.shape}")
+
+
+    #     #         else:
+    #     #             raise ValueError(f"[RWP] Unsupported noise_range setting: {noise_range}")
+
+
+            
+    #     # # forward + backward with noise → 得到 g₁
+    #     # with self.compute_loss_context_manager():
+    #     #     loss_noisy = self.compute_loss(model, inputs)
+
+        
+
+
+    #     # if self.args.n_gpu > 1:
+    #     #     loss_noisy = loss_noisy.mean()
+    #     # if self.args.gradient_accumulation_steps > 1 and not self.deepspeed:
+    #     #     loss_noisy = loss_noisy / self.args.gradient_accumulation_steps
+
+
+    #     # self.model.zero_grad()
+
+    #     # # loss 的 backward
+    #     # if self.do_grad_scaling:
+    #     #     self.scaler.scale(loss).backward()
+    #     # elif self.use_apex:
+    #     #     with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+    #     #         scaled_loss.backward()
+    #     # elif self.deepspeed:
+    #     #     # loss gets scaled under gradient_accumulation_steps in deepspeed
+    #     #     loss = self.deepspeed.backward(loss)
+    #     # else:
+    #     #     loss.backward()
+
+    #     # g1 = self._gather_grad_vector(model)
+
+    #     # # 恢复参数值
+    #     # with torch.no_grad():
+    #     #     for param, noise in noise_list:
+    #     #         param.sub_(noise)
+
+    #     # # === Gradient mix ===
+    #     # # Step 3: 梯度融合
+    #     # # g ← λ·g₁ + (1 - λ)·g₀ 
+    #     # # 其中 g0 是没有扰动的， g1 是有扰动的 ,其对应的权重系数分别为  rwp_a，  rwp_b
+    #     # mixed_grad = self.args.rwp_a * g0 + self.args.rwp_b * g1  
+    #     # self._assign_grad_vector(model, mixed_grad)
+
+    #     # DDP 模式下进行梯度同步
+    #     if use_ddp and torch.distributed.is_initialized():
+    #         torch.distributed.all_reduce(mixed_grad)
+    #         mixed_grad /= torch.distributed.get_world_size()
+
+    #     # === Optimizer step ===
+    #     if is_torch_tpu_available():
+    #         if self.do_grad_scaling:
+    #             self.scaler.step(self.optimizer)
+    #             self.scaler.update()
+    #         else:
+    #             xm.optimizer_step(self.optimizer)
+    #     elif self.do_grad_scaling:
+    #         scale_before = self.scaler.get_scale()
+    #         self.scaler.step(self.optimizer)
+    #         self.scaler.update()
+    #         scale_after = self.scaler.get_scale()
+    #         optimizer_was_run = scale_before <= scale_after
+    #     else:
+    #         self.optimizer.step()
+
+    
+    def generate_noise(self,param, mode, std, fisher_param=None,fisher_scaler=0): 
+        """
+        Generate noise to inject into a parameter tensor using specified mode.
+
+        """
+
+        # 跳过空参数，初始的lora_a，b
+        if param.numel() == 0:
+            return torch.zeros_like(param)
+
+
+        if mode == "Gauss_standard":
+            # ε_ij ~ N(0, σ²) 
+            # 正态分布，每个元素的标准差都是σ，所有噪声元素共享相同标准差,与参数的值无关
+            # 标准高斯噪声：所有元素独立采样于 N(0, σ²)
+            # randn_like 生成标准正态分布（标准差为 1），再通过 * std 缩放为 N(0, sigma²)
+            
+            # 下面代码 与 noise = torch.normal(mean=0., std=std, size=param.shape)完全等价
+            
+            scaler =  std
+            noise = torch.randn_like(param) * scaler  # 标准差为 std
+
+            return noise
+        elif mode == "Gauss_element":
+            # ε_ij ~ N(0, σ² * |W_ij|²)
+            # 每个元素都是独立地根据 param的绝对值进行缩放 
+            # 元素级噪声：每个元素独立采样于 N(0, σ² * |W_ij|²)
+            # noise = torch.normal(
+            #     mean=0.0, 
+            #     std=std * (param.abs()+ 1e-16)  # 标准差为 sigma * |W_ij|
+            # )
+            # return noise
+            # 经过分析  torch.normal 和  torch.randn_like   的实现是一样的
+
+            # 另一种实现 
+            # 生成标准正态分布后 然后再乘以 param 的绝对值
+            scaler = std * (param.abs()+ 1e-16)
+            noise = torch.randn_like(param) * scaler
+            return noise
+
+        elif mode == "Gauss_matrix":
+            # # ε_ij ~ N(0, σ² * ||W||_F²)
+            # 计算 Frobenius 范数：||W||_F = sqrt(sum(|W_ij|^2))
+            fro_norm = torch.norm(param, p='fro')  # 直接计算 Frobenius 范数
+            # 生成噪声：ε_ij ~ N(0, σ² * ||W||_F²)
+            # 所有噪声元素共享 相同标准差 σ * ||W||_F，因此生成标准正态分布后统一乘以该标准差
+            scaler =  std * fro_norm
+            noise = torch.randn_like(param)  * scaler
+
+        
+
+        elif mode == "lpf_sgd":
+            # LPF-SGD: ε_ij ~ N(0, σ² * ||W_i||^2)
+            # ε_ij ~ N(0,σ² * ||W_i,:||^2)
+
+            """# 参考的官方实现 
+            # [LPF-SGD/codes/wrn_dataaug/example/lpf_train.py at master · devansh20la/LPF-SGD]
+            # (https://github.com/devansh20la/LPF-SGD/blob/master/codes/wrn_dataaug/example/lpf_train.py)
+            if len(mp.shape) > 1:
+                    sh = mp.shape
+                    sh_mul = np.prod(sh[1:])
+            
+            # 下面这行代码调用了三个代码 
+            # mp.view(m, -1).norm(dim=1, keepdim=True)：取每行范数 ||W_i||_2, shape = [m, 1]
+            # row_norm.repeat(1, n).view(m, n) ： 将它复制成和 param 同形状 scale 矩阵，shape = [m, n]
+            
+                    temp = mp.view(sh[0], -1).norm(dim=1, keepdim=True).repeat(1, sh_mul).view(mp.shape)
+            # torch.normal :从 N(0, (std * scale)^2) 中采样
+                    temp = torch.normal(0, std*temp).to(mp.data.device)
+            else: # 如果是偏置或 LayerNorm weight 这类1D参数
+                    temp = torch.empty_like(mp, device=mp.data.device)
+                    temp.normal_(0, std*(mp.view(-1).norm().item() + 1e-16))
+            """
+            # 按着原代码逻辑与风格的实现
+            # if len(param.shape) > 1:
+            #     sh = param.shape
+            #     #  filter 也就是矩阵的每一行
+            #     sh_mul = np.prod(sh[1:])
+            #     #  param.view(sh[0], -1).norm(dim=1, keepdim=True):计算每一行的范数  shape = [m, 1]
+            #     #  repeat(1, sh_mul): 将这一行的结果都变成这一行的范数
+            #     noise_temp = param.view(sh[0], -1).norm(dim=1, keepdim=True).repeat(1, sh_mul).view(param.shape)
+            #     #  生成一个与 std * param 形状相同的张量，
+            #     # 每个元素从均值为 0、标准差为 std * param 对应位置值的正态分布中采样
+            #     noise_temp = torch.normal(0, std*noise_temp).to(param.data.device)
+            # else:
+            #     # 对于 bias 或 LayerNorm 的一维参数
+            #     noise_temp = torch.empty_like(param)
+            #     noise_temp.normal_(0, std*(param.view(-1).norm().item() + 1e-16))
+            # return noise_temp
+
+             
+
+            # 从 N(0, 1)进行缩放，而不是 torch.normal 
+            if len(param.shape) > 1:
+                sh = param.shape
+                sh_mul = np.prod(sh[1:])
+                # 每行的L2范数：[m, 1]
+                row_norms = param.view(sh[0], -1).norm(dim=1, keepdim=True)
+                # 将其扩展为与param相同形状
+                std_matrix = row_norms.repeat(1, sh_mul).view(param.shape)
+                # 使用 randn_like，然后缩放为每个元素 std = std * row_norm
+                scaler = std * std_matrix
+                noise_temp = torch.randn_like(param) * scaler
+            else:
+                # 对于一维参数，先计算整体L2范数（加上稳定项）
+                scale = std * (param.view(-1).norm().item() + 1e-16)
+                noise_temp = torch.randn_like(param) * scale
+
+            return noise_temp
+
+        elif mode == "mARWP_fisher":
+
+            """
+            https://github.com/nblt/mARWP/blob/main/train_marwp.py
+
+            官方实现： 
+            with torch.no_grad():
+                noise = []
+                for ii, mp in enumerate(model.parameters()):
+                    sh = mp.data.shape   # 当前参数张量的形状
+                    sh_mul = int(np.prod(sh[1:])) # 每一行（如 conv/filter）中包含的元素个数，用于广播
+                    # 如果提供了 Fisher 信息（任务相关的方向不确定性指标）
+                    if fisher_arr != []:
+                        # 将 Fisher 信息张量调整形状为 [行数, -1]，在每一行上求和（即累计该行的 Fisher 信息）
+                        # 将 [行数, 1] 的 Fisher 信息扩展（广播）为与参数形状相同的张量
+                        fisher = fisher_arr[ii].view(sh[0], -1).sum(dim=1, keepdim=True).repeat(1, sh_mul).view(sh)
+                        
+                    if len(mp.shape) > 1:
+                        # 对于多维参数（如 weight matrix），先计算每一行的 L2 范数,然后 扩展成与 mp 相同的 shape
+                        temp = mp.view(sh[0], -1).norm(dim=1, keepdim=True).repeat(1, sh_mul).view(mp.shape)
+                        # # 使用标准正态分布采样，然后缩放标准差为：args.sigma × 每行范数
+                        temp = torch.normal(0, args.sigma*temp).to(mp.data.device)
+                    else:
+                        temp = torch.empty_like(mp, device=mp.data.device)
+                        temp.normal_(0, args.sigma*(mp.view(-1).norm().item() + 1e-16))
+                    
+                    # ---- Fisher 相关的缩放逻辑（任务感知噪声）----
+                    if fisher_arr != []:
+                    
+                        # 使用 Fisher 信息缩放噪声项：
+                        # temp ← temp / sqrt(1 + η × fisher)
+                        # 使得在“确定性强”（fisher 大）的方向上抑制噪声，反之增强不确定方向上的噪声
+
+                        temp /= torch.sqrt(1 + args.eta * fisher)
+                        
+                    noise.append(temp)
+                    mp.data.add_(noise[-1])
+
+            
+            """
+
+
+            sh = param.shape
+            sh_mul = np.prod(sh[1:])
+            if len(param.shape) > 1:
+                # 计算每一行的 L2 范数，并广播为和 mp 相同形状
+                row_norms = param.view(sh[0], -1).norm(dim=1, keepdim=True)  # shape = [m, 1]
+                std_matrix = row_norms.repeat(1, sh_mul).view(param.shape)
+
+                # 构建噪声标准差张量
+                scaler = std * std_matrix
+
+                # 使用标准正态采样后乘以 std，实现与 normal(mean=0, std=...) 等效行为
+                noise_temp = torch.randn_like(param) * scaler
+            else:
+                # 一维参数：整体 L2 范数 + ε 保证数值稳定
+                scale = std * (param.view(-1).norm().item() + 1e-16)
+                noise_temp = torch.randn_like(param) * scale
+
+            # 在生成噪声的代码中添加
+            # assert noise_temp.shape == fisher_param.shape, "Fisher 信息形状与噪声不匹配"
+            if fisher_param is not None:
+                # 按着原始实现，这里应该对 Fisher_param 按行来计算 
+                # 按行 sum 得到每行一个 Fisher 值 , 广播扩展为完整参数 shape
+                fisher =  fisher_param.view(sh[0], -1).sum(dim=1, keepdim=True).repeat(1, sh_mul).view(sh)
+                # 按照 Fisher 信息缩放噪声项： ε ← ε / sqrt(1 + η × F)
+                noise_temp /= torch.sqrt(1 +  fisher_scaler* fisher )
+
+            return noise_temp
+        
+
+        elif mode == "flatLoRA":
+            # 从 N(0, 1)进行缩放，而不是 torch.normal 
+            if len(param.shape) > 1:
+                sh = param.shape # 如果维度为 m * n
+                sh_mul = np.prod(sh[1:]) # 这个就是 n
+
+                # 每行的L2范数：[m, 1]
+                row_norms = param.view(sh[0], -1).norm(dim=1, keepdim=True)
+                # 将其扩展为与param相同形状
+                std_matrix = row_norms.repeat(1, sh_mul).view(param.shape)
+                # 使用 randn_like，然后缩放为每个元素 std = std * row_norm
+                scaler = std / math.sqrt(param.shape[1]) * std_matrix 
+
+                noise_temp = torch.randn_like(param) * scaler
+            else:
+                # 对于一维参数，先计算整体L2范数（加上稳定项）
+                n = param.shape[0]  # 一维向量的“长度”就是输出维度
+                scale = std / math.sqrt(n) * (param.view(-1).norm().item() + 1e-16)
+
+                noise_temp = torch.randn_like(param) * scale
+
+            return noise_temp
+
+        else:
+            raise ValueError(f"Unknown noise mode: {mode}")
+        
+    def _gather_grad_vector(self, model):
+        """
+        收集所有 requires_grad 且有 grad 的参数梯度，拼接为一维向量
+        """
+        grad_list = []
+        for param in model.parameters():
+            if param.requires_grad and param.grad is not None:
+                grad_list.append(param.grad.detach().clone().view(-1))
+        if len(grad_list) == 0:
+            raise ValueError("未检测到任何梯度，请检查梯度是否正确反向传播。")
+        return torch.cat(grad_list)
+
+    def _assign_grad_vector(self, model, grad_vector):
+        """
+        将一维梯度向量 grad_vector 拆分并赋值回模型参数的 .grad
+        """
+        offset = 0
+        for param in model.parameters():
+            if param.requires_grad and param.grad is not None:
+                numel = param.numel()
+                param.grad.data.copy_(grad_vector[offset:offset + numel].view_as(param))
+                offset += numel
+        if offset != grad_vector.numel():
+            raise ValueError("Grad vector size 与参数维度不匹配！")
+    
+    
+    
+    
     def _inner_training_loop(
         self, batch_size=None, args=None, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None
     ):
@@ -277,6 +620,8 @@ class UIETrainer(Seq2SeqTrainer):
         # _total_loss_scalar is updated everytime .item() has to be called on tr_loss and stores the sum of all losses
         self._total_loss_scalar = 0.0
         self._globalstep_last_logged = self.state.global_step
+
+        # 在训练之前，将梯度进行归0
         model.zero_grad()
 
         self.control = self.callback_handler.on_train_begin(args, self.state, self.control)
@@ -354,19 +699,177 @@ class UIETrainer(Seq2SeqTrainer):
                 if step % args.gradient_accumulation_steps == 0:
                     self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
 
-                if (
-                    (total_batched_samples % args.gradient_accumulation_steps != 0)
-                    and args.local_rank != -1
-                    and args._no_sync_in_gradient_accumulation
-                ):
-                    # Avoid unnecessary DDP synchronization since there will be no backward pass on this example.
-                    with model.no_sync():
+
+
+                if self.args.gradient_accumulation_steps == 1 and  ("rpw_single_jiou" in self.args.rwp_type):
+                # 添加一个分支，专门处理 Rwp 按着论文，奇偶不同的情形，作为一起进行合并的情形
+
+                    if step % 2 == 0:
+                        pass
+
+                    if step % 2 == 1:
+                        pass
+
+                
+                else :
+
+                    if (
+                        (total_batched_samples % args.gradient_accumulation_steps != 0)
+                        and args.local_rank != -1
+                        and args._no_sync_in_gradient_accumulation
+                        
+                    ):
+                        # Avoid unnecessary DDP synchronization since there will be no backward pass on this example.
+                        with model.no_sync():
+                            # if self.args.use_probe:
+                            if self.args.train_method == 'use_probe':
+                                tr_loss_step = self.training_step(model, inputs)
+                            elif self.args.train_method == "lora":
+                            # 修改进行梯度更新的地方，替换掉原来的函数调用
+                            # -------------------
+                                model.train()
+                                enable_running_stats(model)
+                                inputs = self._prepare_inputs(inputs)
+
+                                if is_sagemaker_mp_enabled():
+                                    loss_mb = smp_forward_backward(
+                                        model, inputs, self.args.gradient_accumulation_steps)
+                                    return loss_mb.reduce_mean().detach().to(self.args.device)
+                                
+                                # self.print_trainable_parameters(model)
+                                with self.compute_loss_context_manager():
+                                    loss = self.compute_loss(model, inputs)
+
+                                logger.info(f'training_step compute_loss: {loss.item():.4f}')
+                                
+
+                                if self.args.n_gpu > 1:
+                                    loss = loss.mean()
+
+                                if self.args.gradient_accumulation_steps > 1 and not self.deepspeed:
+                                    loss = loss / self.args.gradient_accumulation_steps
+
+                                ########################## Regularization ##########################
+                                if self.args.lora_strategy.lower() == "olora":
+                                    orthogonal_loss = 0.
+                                    for name, param in model.named_parameters():
+                                        if "lora_A" in name:
+                                            for name_, param_ in model.named_parameters():
+                                                if "loranew_A" in name_ and name.split("lora_A")[0] == name_.split("loranew_A")[0]:
+                                                    orthogonal_loss += torch.abs(
+                                                        torch.mm(param, param_.T)).sum()
+                                                    break
+
+                                    l2_loss = 0.
+                                    for name, param in model.named_parameters():
+                                        if "loranew_" in name:
+                                            l2_loss += torch.norm(param, p=2)
+
+                                    lamda_1 = self.args.lamda_1
+                                    lamda_2 = self.args.lamda_2
+
+                                    logger.info(f"orthogonal_loss: {orthogonal_loss.item():.4f}; l2_loss: {l2_loss.item():.4f}; accuracy_loss: {loss.item():.4f}; λ1: {lamda_1}; λ2: {lamda_2}")
+
+                                    loss = loss + orthogonal_loss * lamda_1 + l2_loss * lamda_2
+                                elif self.args.lora_strategy.lower() == "nlora":
+                                    l1_loss = 0.
+                                    loranew_A_params = {}
+                                    loranew_B_params = {}
+                                    for name, param in self.model.named_parameters():
+                                        if "loranew_A" in name:
+                                            loranew_A_params[name.split("loranew_A")[0]] = param
+                                        elif "loranew_B" in name:
+                                            loranew_B_params[name.split("loranew_B")[0]] = param
+
+                                    for key in loranew_A_params:
+                                        if key in loranew_B_params:
+                                            l1_loss += torch.norm(
+                                                torch.mm(loranew_A_params[key], loranew_B_params[key]), p=1)
+
+                                    lamda_1 = self.args.lamda_1
+
+                                    logger.info(f"Nlora_loss: {l1_loss.item():.4f};   accuracy_loss: {loss.item():.4f}; λ1: {lamda_1};")
+
+                                    loss = loss + l1_loss * lamda_1
+                                elif self.args.lora_strategy.lower() == "inclora":
+                                    logger.info(f"inclora accuracy_loss: {loss.item():.4f}")
+                                elif self.args.lora_strategy.lower() == "lora_l2":
+                                    l2_loss = 0.
+                                    for name, param in model.named_parameters():
+                                        if "loranew_" in name:
+                                            l2_loss += torch.norm(param, p=2)
+
+                                    logger.info(f" l2_loss: {l2_loss.item():.4f}; accuracy_loss: {loss.item():.4f};  λ2: {lamda_2}")
+                                    lamda_2 = self.args.lamda_2
+                                    loss = loss + l2_loss * lamda_2
+                                ######################################################################
+                                logger.debug(f"sum_loss: {loss.item():.4f}")
+
+                                if self.do_grad_scaling:
+                                    self.scaler.scale(loss).backward()
+                                elif self.use_apex:
+                                    with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+                                        scaled_loss.backward()
+                                elif self.deepspeed:
+                                    # loss gets scaled under gradient_accumulation_steps in deepspeed
+                                    loss = self.deepspeed.backward(loss)
+                                else:
+                                    loss.backward()
+
+                                tr_loss_step = loss.detach()
+                            #------------------------------
+                            elif self.args.train_method == "finetune":
+                            # 修改进行梯度更新的地方，替换掉原来的函数调用
+                            # -------------------
+                                model.train()
+                                enable_running_stats(model)
+                                inputs = self._prepare_inputs(inputs)
+
+                                if is_sagemaker_mp_enabled():
+                                    loss_mb = smp_forward_backward(
+                                        model, inputs, self.args.gradient_accumulation_steps)
+                                    return loss_mb.reduce_mean().detach().to(self.args.device)
+                                
+                                # self.print_trainable_parameters(model)
+                                with self.compute_loss_context_manager():
+                                    loss = self.compute_loss(model, inputs)
+
+                                logger.info(f'training_step compute_loss: {loss.item():.4f}')
+                                
+
+                                if self.args.n_gpu > 1:
+                                    loss = loss.mean()
+
+                                if self.args.gradient_accumulation_steps > 1 and not self.deepspeed:
+                                    loss = loss / self.args.gradient_accumulation_steps
+                                
+
+                                logger.debug(f"loss: {loss.item():.4f}")
+
+                                if self.do_grad_scaling:
+                                    self.scaler.scale(loss).backward()
+                                elif self.use_apex:
+                                    with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+                                        scaled_loss.backward()
+                                elif self.deepspeed:
+                                    # loss gets scaled under gradient_accumulation_steps in deepspeed
+                                    loss = self.deepspeed.backward(loss)
+                                else:
+                                    loss.backward()
+
+                                tr_loss_step = loss.detach()
+
+                            
+
+
+
+                    else:
                         # if self.args.use_probe:
                         if self.args.train_method == 'use_probe':
                             tr_loss_step = self.training_step(model, inputs)
                         elif self.args.train_method == "lora":
-                        # 修改进行梯度更新的地方，替换掉原来的函数调用
-                        # -------------------
+                            # 修改进行梯度更新的地方，替换掉原来的函数调用
+                            # -------------------
                             model.train()
                             enable_running_stats(model)
                             inputs = self._prepare_inputs(inputs)
@@ -389,7 +892,7 @@ class UIETrainer(Seq2SeqTrainer):
                             if self.args.gradient_accumulation_steps > 1 and not self.deepspeed:
                                 loss = loss / self.args.gradient_accumulation_steps
 
-                            ########################## Regularization ##########################
+                            ########################### Regularization ##########################
                             if self.args.lora_strategy.lower() == "olora":
                                 orthogonal_loss = 0.
                                 for name, param in model.named_parameters():
@@ -408,7 +911,8 @@ class UIETrainer(Seq2SeqTrainer):
                                 lamda_1 = self.args.lamda_1
                                 lamda_2 = self.args.lamda_2
 
-                                logger.info(f"orthogonal_loss: {orthogonal_loss.item():.4f}; l2_loss: {l2_loss.item():.4f}; accuracy_loss: {loss.item():.4f}; λ1: {lamda_1}; λ2: {lamda_2}")
+                                logger.info(
+                                    f"orthogonal_loss: {orthogonal_loss.item():.4f}; l2_loss: {l2_loss.item():.4f}; accuracy_loss: {loss.item():.4f}; λ1: {lamda_1}; λ2: {lamda_2}")
 
                                 loss = loss + orthogonal_loss * lamda_1 + l2_loss * lamda_2
                             elif self.args.lora_strategy.lower() == "nlora":
@@ -439,11 +943,257 @@ class UIETrainer(Seq2SeqTrainer):
                                     if "loranew_" in name:
                                         l2_loss += torch.norm(param, p=2)
 
-                                logger.info(f" l2_loss: {l2_loss.item():.4f}; accuracy_loss: {loss.item():.4f};  λ2: {lamda_2}")
+                                logger.info(f"lora_l2 l2_loss: {l2_loss.item():.4f}; accuracy_loss: {loss.item():.4f};  λ2: {lamda_2}")
                                 lamda_2 = self.args.lamda_2
                                 loss = loss + l2_loss * lamda_2
                             ######################################################################
+                            # PyTorch中，`backward()`方法
+                            # 会计算当前张量（在这里是损失值`loss`）相对于各个需要梯度的参数的梯度，
+                            # 并将这些梯度累积到参数的`.grad`属性中。
+                            # 这是训练神经网络时的标准步骤，
+                            # 为后续优化器更新参数（如 optimizer.step()）提供梯度信息
+                            
                             logger.debug(f"sum_loss: {loss.item():.4f}")
+                            if self.do_grad_scaling:
+                                self.scaler.scale(loss).backward()
+                            elif self.use_apex:
+                                with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+                                    scaled_loss.backward()
+                            elif self.deepspeed:
+                                # loss gets scaled under gradient_accumulation_steps in deepspeed
+                                loss = self.deepspeed.backward(loss)
+                            else:
+                                loss.backward()
+                                
+                            # detach()`会创建一个新的张量，与原始张量共享数据，但剥离计算图，
+                            # 即新张量不再有梯度历史。这意味着对这个新张量的操作不会影响反向传播，也不会在计算梯度时被追踪。
+                            # 这一步通常用于将损失值从计算图中分离出来，
+                            # 以便进行后续的数值记录或日志，而不会保留不必要的计算图信息，从而节省内存。
+                            tr_loss_step = loss.detach()
+                            loss_cleaned_log = tr_loss_step
+
+
+
+                            # 这里已经完成了 损失函数和梯度的计算，相当于完成了g0的计算
+                            # 这里累积的是lora 部分的梯度信息，因为其他部分都被fixed住了，实际上没有梯度
+                            g0 = self._gather_grad_vector(model)
+                                
+                            # ------------------- 
+                            # -------------------
+                            # 如果使用 rwp 来进行 更新梯度，在这一步要计算扰动损失 也就是g1
+                            # 并且扰动损失要和原来的损失要进行混合
+                            if self.args.rwp_type != "":
+                                # pass
+                                # 这里是 RWP 的损失计算过程 
+                                # g0 = self._gather_grad_vector(model)
+                                logger.info(f"go-loss-cleaned: {loss_cleaned_log}")
+                                
+                                
+                                # ----------------------------
+                                # Step 2: 计算扰动梯度 g1
+                                # ----------------------------
+                                # Step 2: g₁ - 添加扰动并计算噪声梯度
+                                # === Step 2: g₁ ===
+                                # 清除梯度缓冲区，确保后续计算 g1 时梯度从零开始累积
+                                model.zero_grad()
+                                disable_running_stats(model) # 禁用 BatchNorm 的运行统计
+
+                                # 为参数添加扰动
+                                rwp_noise_dict = {}
+                                # logger.debug(f"RWP add noise- mode : {self.args.rwp_noise_type} noise_std : {self.args.noise_std}")
+                                with torch.no_grad():
+                                    for name, param in model.named_parameters():
+                                        # if not param.requires_grad:
+                                        #     continue
+                                        apply_noise = False
+                                        if "lora" in self.args.rwp_type and "loranew_" in name:
+                                            apply_noise = True
+                                            
+                                        elif "full" in self.args.rwp_type:
+                                            apply_noise = True
+                                        # 已经训练好的lora部分也不会被添加噪声，只有原来的模型的参数会被添加噪声
+                                        elif "origin"in self.args.rwp_type and  ("lora"  not in name):
+                                            apply_noise = True
+
+
+                                        if apply_noise:
+                                            fisher_param = None
+                                            fisher_scaler = 0
+                                            if 'fisher' in self.args.rwp_noise_type:
+                                                fisher_param = self.fisher_dict.get(name, None)
+                                                fisher_scaler =  self.args.rwp_fisher_app_scaler
+                                            
+                                            noise = self.generate_noise(
+                                                param=param,
+                                                mode=self.args.rwp_noise_type,  # one of: standard, matrix, element, filter, fisher
+                                                std=self.args.noise_std, 
+                                                fisher_param=fisher_param,
+                                                fisher_scaler= fisher_scaler
+                                            )
+                                            param.data.add_(noise)
+                                            # 保存为每一层参数添加的噪声，用来还原模型
+                                            rwp_noise_dict[name] = noise
+                                            # logger.debug(f"[RWP-{self.args.rwp_noise_type}] Injected noise into: {name} | shape: {param.shape}")
+
+
+                                    
+                                # forward + backward with noise → 得到 g₁
+                                with self.compute_loss_context_manager():
+                                    loss_noisy = self.compute_loss(model, inputs)
+
+                                #-----------
+                                logger.info(f'training_step RWP model with {self.args.rwp_noise_type} g1--loss_noise : {loss_noisy.item():.4f}')
+
+                                # 添加正则化处理，如果需要的话
+                                ########################### Regularization ##########################
+                                if self.args.lora_strategy.lower() == "olora":
+                                    orthogonal_loss = 0.
+                                    for name, param in model.named_parameters():
+                                        if "lora_A" in name:
+                                            for name_, param_ in model.named_parameters():
+                                                if "loranew_A" in name_ and name.split("lora_A")[0] == name_.split("loranew_A")[0]:
+                                                    orthogonal_loss += torch.abs(
+                                                        torch.mm(param, param_.T)).sum()
+                                                    break
+
+                                    l2_loss = 0.
+                                    for name, param in model.named_parameters():
+                                        if "loranew_" in name:
+                                            l2_loss += torch.norm(param, p=2)
+
+                                    lamda_1 = self.args.lamda_1
+                                    lamda_2 = self.args.lamda_2
+
+                                    logger.info(
+                                        f"orthogonal_loss: {orthogonal_loss.item():.4f}; l2_loss: {l2_loss.item():.4f}; loss_noisy: {loss_noisy.item():.4f}; λ1: {lamda_1}; λ2: {lamda_2}")
+
+                                    loss_noisy = loss_noisy + orthogonal_loss * lamda_1 + l2_loss * lamda_2
+                                elif self.args.lora_strategy.lower() == "nlora":
+                                    l1_loss = 0.
+                                    loranew_A_params = {}
+                                    loranew_B_params = {}
+                                    for name, param in self.model.named_parameters():
+                                        if "loranew_A" in name:
+                                            loranew_A_params[name.split("loranew_A")[0]] = param
+                                        elif "loranew_B" in name:
+                                            loranew_B_params[name.split("loranew_B")[0]] = param
+
+                                    for key in loranew_A_params:
+                                        if key in loranew_B_params:
+                                            l1_loss += torch.norm(
+                                                torch.mm(loranew_A_params[key], loranew_B_params[key]), p=1)
+
+                                    lamda_1 = self.args.lamda_1
+
+                                    logger.info(f"Nlora_loss: {l1_loss.item():.4f};   loss_noisy: {loss_noisy.item():.4f}; λ1: {lamda_1};")
+
+                                    loss_noisy = loss_noisy + l1_loss * lamda_1
+                                elif self.args.lora_strategy.lower() == "inclora":
+                                    logger.info(f"inclora loss_noisy: {loss_noisy.item():.4f}")
+                                elif self.args.lora_strategy.lower() == "lora_l2":
+                                    l2_loss = 0.
+                                    for name, param in model.named_parameters():
+                                        if "loranew_" in name:
+                                            l2_loss += torch.norm(param, p=2)
+
+                                    logger.info(f"lora_l2 l2_loss: {l2_loss.item():.4f}; loss_noisy: {loss_noisy.item():.4f};  λ2: {lamda_2}")
+                                    lamda_2 = self.args.lamda_2
+                                    loss_noisy = loss_noisy + l2_loss * lamda_2
+                                ######################################################################
+                                logger.debug(f"g1---sum_loss(with some ): {loss_noisy.item():.4f}")
+
+                                
+                                #---多GPU，平均损失---------
+                                if self.args.n_gpu > 1:
+                                    loss_noisy = loss_noisy.mean()
+                                if self.args.gradient_accumulation_steps > 1 and not self.deepspeed:
+                                    loss_noisy = loss_noisy / self.args.gradient_accumulation_steps
+
+                                
+
+
+                                # loss 的 backward
+                                if self.do_grad_scaling:
+                                    self.scaler.scale(loss_noisy).backward()
+                                elif self.use_apex:
+                                    with amp.scale_loss(loss_noisy, self.optimizer) as scaled_loss:
+                                        scaled_loss.backward()
+                                elif self.deepspeed:
+                                    # loss gets scaled under gradient_accumulation_steps in deepspeed
+                                    loss_noisy = self.deepspeed.backward(loss_noisy)
+                                else:
+                                    loss_noisy.backward()
+
+                                loss_noisy_log = loss_noisy.detach()
+                                logger.info(f"g1-loss_noisy: {loss_noisy_log.item():.4f}")
+
+                                # 保存添加噪声扰动的模型的参数的fisher信息 
+                                # 这里是根据 添加噪声扰动后的梯度计算得到的fisher信息矩阵
+                                if 'fisher' in self.args.rwp_noise_type:
+                                    with torch.no_grad():
+                                        for name, param in self.model.named_parameters():
+                                            if param.grad is not None:
+                                                grad_squared = param.grad.detach() ** 2
+                                                # 使用指数滑动平均更新 fisher_dict
+                                                self.fisher_dict[name] = (self.fisher_dict[name] *  self.args.rwp_fisher_cal_scaler + grad_squared )
+
+
+                                # 收集扰动梯度 g1
+                                g1 = self._gather_grad_vector(model)
+
+                                # ----------------------------
+                                # Step 3: 恢复参数并混合梯度
+                                # ----------------------------
+                                # 恢复参数值
+                                # 将模型从扰动状态还原回原始状态,然后进行训练
+                                # 正确代码
+                                with torch.no_grad():
+                                    for name, noise in rwp_noise_dict.items():  # 使用 .items()
+                                        param = model.get_parameter(name)       # 根据名称获取参数
+                                        param.data.sub_(noise)                  # 减去噪声
+
+                                # === Gradient mix ===
+                                # Step 3: 梯度融合
+                                # g ← a·g0 + b·g1
+                                # 其中 g0 是没有扰动的， g1 是有扰动的 ,其对应的权重系数分别为  rwp_a，  rwp_b
+                                loss_rwp  = self.args.rwp_a * loss_cleaned_log + self.args.rwp_b* loss_noisy_log
+                                logger.info(f"loss_rwp：{loss_rwp}；g0-cleaned_loss: {loss_cleaned_log.item():.4f}; g1-noisy_loss: {loss_noisy_log.item():.4f}; a :{self.args.rwp_a}, b :{self.args.rwp_b}")
+                                logger.info(f"{loss_rwp} = {self.args.rwp_a} * {loss_cleaned_log.item():.4f} + {self.args.rwp_b} *{loss_noisy_log.item():.4f} ")
+
+                                tr_loss_step = loss_rwp
+                                
+                                # 进行梯度混合
+                                mixed_grad = self.args.rwp_a * g0 + self.args.rwp_b * g1 
+
+                                self._assign_grad_vector(model, mixed_grad)
+
+                        elif self.args.train_method == "finetune":
+                            # 修改进行梯度更新的地方，替换掉原来的函数调用
+                            # -------------------
+                            model.train()
+                            enable_running_stats(model)
+                            inputs = self._prepare_inputs(inputs)
+
+                            if is_sagemaker_mp_enabled():
+                                loss_mb = smp_forward_backward(
+                                    model, inputs, self.args.gradient_accumulation_steps)
+                                return loss_mb.reduce_mean().detach().to(self.args.device)
+                            
+                            # self.print_trainable_parameters(model)
+                            with self.compute_loss_context_manager():
+                                loss = self.compute_loss(model, inputs)
+
+                            logger.info(f'training_step compute_loss: {loss.item():.4f}')
+                            
+
+                            if self.args.n_gpu > 1:
+                                loss = loss.mean()
+
+                            if self.args.gradient_accumulation_steps > 1 and not self.deepspeed:
+                                loss = loss / self.args.gradient_accumulation_steps
+                            
+
+                            logger.debug(f"loss: {loss.item():.4f}")
 
                             if self.do_grad_scaling:
                                 self.scaler.scale(loss).backward()
@@ -457,109 +1207,6 @@ class UIETrainer(Seq2SeqTrainer):
                                 loss.backward()
 
                             tr_loss_step = loss.detach()
-                        #------------------------------
-
-                else:
-                    # if self.args.use_probe:
-                    if self.args.train_method == 'use_probe':
-                        tr_loss_step = self.training_step(model, inputs)
-                    elif self.args.train_method == "lora":
-                        # 修改进行梯度更新的地方，替换掉原来的函数调用
-                        # -------------------
-                        model.train()
-                        enable_running_stats(model)
-                        inputs = self._prepare_inputs(inputs)
-
-                        if is_sagemaker_mp_enabled():
-                            loss_mb = smp_forward_backward(
-                                model, inputs, self.args.gradient_accumulation_steps)
-                            return loss_mb.reduce_mean().detach().to(self.args.device)
-                        
-                        # self.print_trainable_parameters(model)
-                        with self.compute_loss_context_manager():
-                            loss = self.compute_loss(model, inputs)
-
-                        logger.info(f'training_step compute_loss: {loss.item():.4f}')
-                        
-
-                        if self.args.n_gpu > 1:
-                            loss = loss.mean()
-
-                        if self.args.gradient_accumulation_steps > 1 and not self.deepspeed:
-                            loss = loss / self.args.gradient_accumulation_steps
-
-                        ########################### Regularization ##########################
-                        if self.args.lora_strategy.lower() == "olora":
-                            orthogonal_loss = 0.
-                            for name, param in model.named_parameters():
-                                if "lora_A" in name:
-                                    for name_, param_ in model.named_parameters():
-                                        if "loranew_A" in name_ and name.split("lora_A")[0] == name_.split("loranew_A")[0]:
-                                            orthogonal_loss += torch.abs(
-                                                torch.mm(param, param_.T)).sum()
-                                            break
-
-                            l2_loss = 0.
-                            for name, param in model.named_parameters():
-                                if "loranew_" in name:
-                                    l2_loss += torch.norm(param, p=2)
-
-                            lamda_1 = self.args.lamda_1
-                            lamda_2 = self.args.lamda_2
-
-                            logger.info(
-                                f"orthogonal_loss: {orthogonal_loss.item():.4f}; l2_loss: {l2_loss.item():.4f}; accuracy_loss: {loss.item():.4f}; λ1: {lamda_1}; λ2: {lamda_2}")
-
-                            loss = loss + orthogonal_loss * lamda_1 + l2_loss * lamda_2
-                        elif self.args.lora_strategy.lower() == "nlora":
-                            l1_loss = 0.
-                            loranew_A_params = {}
-                            loranew_B_params = {}
-                            for name, param in self.model.named_parameters():
-                                if "loranew_A" in name:
-                                    loranew_A_params[name.split("loranew_A")[0]] = param
-                                elif "loranew_B" in name:
-                                    loranew_B_params[name.split("loranew_B")[0]] = param
-
-                            for key in loranew_A_params:
-                                if key in loranew_B_params:
-                                    l1_loss += torch.norm(
-                                        torch.mm(loranew_A_params[key], loranew_B_params[key]), p=1)
-
-                            lamda_1 = self.args.lamda_1
-
-                            logger.info(f"Nlora_loss: {l1_loss.item():.4f};   accuracy_loss: {loss.item():.4f}; λ1: {lamda_1};")
-
-                            loss = loss + l1_loss * lamda_1
-                        elif self.args.lora_strategy.lower() == "inclora":
-                            logger.info(f"inclora accuracy_loss: {loss.item():.4f}")
-                        elif self.args.lora_strategy.lower() == "lora_l2":
-                            l2_loss = 0.
-                            for name, param in model.named_parameters():
-                                if "loranew_" in name:
-                                    l2_loss += torch.norm(param, p=2)
-
-                            logger.info(f"lora_l2 l2_loss: {l2_loss.item():.4f}; accuracy_loss: {loss.item():.4f};  λ2: {lamda_2}")
-                            lamda_2 = self.args.lamda_2
-                            loss = loss + l2_loss * lamda_2
-                        ######################################################################
-                        logger.debug(f"sum_loss: {loss.item():.4f}")
-                        if self.do_grad_scaling:
-                            self.scaler.scale(loss).backward()
-                        elif self.use_apex:
-                            with amp.scale_loss(loss, self.optimizer) as scaled_loss:
-                                scaled_loss.backward()
-                        elif self.deepspeed:
-                            # loss gets scaled under gradient_accumulation_steps in deepspeed
-                            loss = self.deepspeed.backward(loss)
-                        else:
-                            loss.backward()
-
-                        tr_loss_step = loss.detach()
-                    # -------------------
-
-
-
 
                 if (
                     args.logging_nan_inf_filter
@@ -631,7 +1278,8 @@ class UIETrainer(Seq2SeqTrainer):
                     #     optimizer_was_run = scale_before <= scale_after
                     # else:
                     #     self.optimizer.step()
-                    elif hasattr(self.optimizer, "first_step") and hasattr(self.optimizer, "second_step"):
+                    # elif hasattr(self.optimizer, "first_step") and hasattr(self.optimizer, "second_step"):
+                    elif 'sam' in self.args.optimizer_type:
                         # === For SAM Optimizer: first_step-second_step two phases ===
                   
                         
@@ -639,6 +1287,7 @@ class UIETrainer(Seq2SeqTrainer):
                         self.optimizer.first_step(zero_grad=True)
 
                         # second forward-backward
+                        # 第二次计算loss，这里计算loss是只根据一个batch来计算loss
                         disable_running_stats(model)
                         with self.compute_loss_context_manager():
                             second_loss = self.compute_loss(model, inputs)
@@ -706,7 +1355,7 @@ class UIETrainer(Seq2SeqTrainer):
                         logger.info(f'SAM training_step second_loss_sum: {second_loss.item():.4f}')
                         ######################################################################
 
-                        # 第二次反向传播
+                        # 第二次反向传播, 
                         if self.do_grad_scaling:
                             self.scaler.scale(second_loss).backward()
                             self.scaler.unscale_(self.optimizer)
@@ -720,8 +1369,6 @@ class UIETrainer(Seq2SeqTrainer):
                             second_loss.backward()
 
                         self.optimizer.second_step(zero_grad=True)
-
-
                     else:
                     # === Standard Optimizer ===
                         if is_torch_tpu_available():
@@ -745,6 +1392,7 @@ class UIETrainer(Seq2SeqTrainer):
                     if optimizer_was_run and not self.deepspeed:
                         self.lr_scheduler.step()
 
+                    # 调用optimner更新梯度，结束之后进行梯度清除，
                     model.zero_grad()
                     self.state.global_step += 1
                     self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
@@ -2121,7 +2769,7 @@ class UIETrainer(Seq2SeqTrainer):
         }
 
     def compute_loss_landscape(
-        self, eval_dataset: Dataset, output_dir, x_range=(-1, 1), y_range=(-1, 1), num_points=10, max_batches=5, sample_batches=False,
+        self, eval_dataset: Dataset, output_dir, distrub_name = 'originModel',x_range=(-1, 1), y_range=(-1, 1), num_points=10, max_batches=2, sample_batches=False,
 
     ):
         """
@@ -2137,18 +2785,17 @@ class UIETrainer(Seq2SeqTrainer):
         loss_grid = np.zeros((num_points, num_points))
 
         # 根据模型判断，这里不妨使用手动
+        # 是否是训练后的模型，还是加载已经训练好的模型
         if args.do_train:
             # 如果进行训练，那么模型的new_lora就是新的当前任务添加的lora
             # Flag_newtaskLoRA = ''  # 如果只干扰训练后的新的任务的lora
             # Flag_onlyLoRA = ''  # 如果只干扰lora 部分
             # Flag_fullModel =  'fullModel'  # 如果干扰模型的所有参数
-            distrub_name = 'fullModel'
             surf_file = os.path.join(
                     output_dir, f"{args.lora_strategy}_{distrub_name}_T5large_testData.h5")
         else:
-            distrub_name = 'fullModel'
             # 如果不进行训练，只展示加载模型的 lossland ，则对模型的所有参数(不包括new_lora)都进行干扰，
-            surf_file = os.path.join(output_dir, f"{distrub_name}_T5large_testData.h5")
+            surf_file = os.path.join(output_dir, f"{distrub_name}_T5large__testData.h5")
 
 
         # 确保目标目录存在（若不存在则创建）
@@ -2168,13 +2815,6 @@ class UIETrainer(Seq2SeqTrainer):
         model = copy.deepcopy(self.model)
         model = self._wrap_model(model, training=False)
 
-        # ✅ 处理 FP16/BF16 评估模式
-        if not self.is_in_train:
-            if args.fp16_full_eval:
-                model = model.to(dtype=torch.float16, device=device)
-            elif args.bf16_full_eval:
-                model = model.to(dtype=torch.bfloat16, device=device)
-
         model = model.to(device=device)
         model.eval()  # 确保模型在 eval 模式
 
@@ -2184,12 +2824,16 @@ class UIETrainer(Seq2SeqTrainer):
         original_params_to_perturb = {}
         for name, param in model.named_parameters():
             if args.do_train:
-                if distrub_name == 'fullModel':
+                if distrub_name == 'originModel':
                     pass
             else:# 不是训练后直接评估，加载的模型不应该包括新添加的 new_lora 部分
-                if distrub_name == 'fullModel':
-                    if "new_lora" not in name : 
+                if distrub_name == 'originModel':
+                    if "loranew_" not in name : 
                         original_params_to_perturb[name] = param.data.clone()
+                elif distrub_name == 'trainedLoRA':
+                    if "lora_" in name  and "loranew_" not in name: 
+                        original_params_to_perturb[name] = param.data.clone()
+
 
         # --------------------- 扰动生成优化 ---------------------
         torch.manual_seed(42)  # 固定随机种子保证可重复性
@@ -2285,19 +2929,38 @@ class UIETrainer(Seq2SeqTrainer):
                                 param.dtype) + yv * perturb_y[name].to(param.dtype)
                         param.add_(delta)  # 原位操作减少内存分配
 
-                # 计算损失
+
+                # 计算损失 (统一使用 prediction_step)
                 total_loss = 0.0
                 for batch in all_batches:
                     inputs = {k: v.to(device) for k, v in batch.items()}
-                    with torch.cuda.amp.autocast(enabled=args.fp16):  # 支持混合精度
-                        outputs = model(**inputs)
-                        loss = F.cross_entropy(
-                            outputs.logits.view(-1, outputs.logits.size(-1)),
-                            inputs["labels"].view(-1)
-                        )
-                    total_loss += loss.item()
-
+                    loss, _, _ = self.prediction_step(
+                        model, 
+                        inputs, 
+                        prediction_loss_only=True, 
+                        ignore_keys=None
+                    )
+                    # 兼容返回为张量/float
+                    total_loss += loss.item() if hasattr(loss, "item") else float(loss)
                 loss_grid[i, j] = total_loss / len(all_batches)
+
+                # # 计算损失
+                # total_loss = 0.0
+                # for batch in all_batches:
+                #     inputs = {k: v.to(device) for k, v in batch.items()}
+                #     with torch.cuda.amp.autocast(enabled=args.fp16):  # 支持混合精度
+                #         outputs = model(**inputs)
+                #         loss = F.cross_entropy(
+                #             outputs.logits.view(-1, outputs.logits.size(-1)),
+                #             inputs["labels"].view(-1)
+                #         )
+                #     total_loss += loss.item()
+
+                # loss_grid[i, j] = total_loss / len(all_batches)
+
+
+
+
 
                 # 每5次迭代清理一次缓存（优化点6）
                 if j % 5 == 0:
@@ -2435,14 +3098,12 @@ class UIETrainer(Seq2SeqTrainer):
 
     def compute_hessian_version1(
         self,
-        flag_Nlora,
         eval_dataset,
         output_dir,
         name="hessian",
         max_batches=10,
         sample_batches=False,
         use_gpu=True,
-        flag_Nlora_full=True,
 
     ):
         """
@@ -2461,20 +3122,16 @@ class UIETrainer(Seq2SeqTrainer):
         # --------------------- 初始化阶段 ---------------------
         # 根据模型判断，这里不妨使用手动
 
-        if flag_Nlora and (not flag_Nlora_full):
-            # 如果是 Nlora 方法，只干扰 task 相关的代码
-            Flag_Nlora_newtask = True
-            Flag_Nlora_full = False
-            Flag_lora = False
-        elif flag_Nlora and flag_Nlora_full:
-            # 如果是 Nlora 方法，干扰 task_lora 和之前的lora 相关的代码
-            Flag_Nlora_newtask = True  # 只要是使用了Nlora，这里就是True
-            Flag_Nlora_full = True  # 这个是用来唯一区别 full 还是 task
-            Flag_lora = False
-        else:
-            Flag_Nlora_newtask = False
-            Flag_Nlora_full = False
-            Flag_lora = True
+        model_type = 'lora'
+        if model_type == 'fintune':
+            #如果模型是经过微调的结果，那么整个模型都要计算Hessian矩阵
+            pass
+        if model_type == 'lora':
+            # 如果模型是经过lora微调的结果，那么只需要计算lora部分的Hessian矩阵, 
+            # 因为原来的模型是冻结的，没有更新所以不需要计算 Hessian 矩阵
+            # 新添加的部分是默认初始化，也不需要计算 Hessian 矩阵
+            hessian_file_lora = os.path.join(output_dir, f"{name}_lora_only-predictDataset_lanczos.h5")
+
 
         logger.info(f'***5***--5-3**1 begin init   ')
         logger.info(
@@ -2482,15 +3139,8 @@ class UIETrainer(Seq2SeqTrainer):
         args = self.args
         device = args.device
 
-        hessian_file_Nlora_fulllora = os.path.join(
-            output_dir, f"{name}_Nlora_only-predictDataset.h5")
-        hessian_file_Nlora_tasklora = os.path.join(
-            output_dir, f"{name}_Nlora_only-predictDataset.h5")
-        hessian_file_lora = os.path.join(
-            output_dir, f"{name}_lora_only-predictDataset_lanczos.h5")
-
         # 创建独立模型副本（关键改进点1：隔离原始模型）
-        model = copy.deepcopy(self.model)
+        model = self.model
         model = self._wrap_model(model, training=False)
 
         # 混合精度处理
@@ -2503,12 +3153,6 @@ class UIETrainer(Seq2SeqTrainer):
         model = model.to(device=device)
         model.eval()
 
-        # 保存初始参数状态（关键改进点2：消除参数污染）
-        # original_state = {
-        # k: v.to(device) if isinstance(v, torch.Tensor) else v
-        # for k, v in model.state_dict().items()
-        # }
-        # original_state = copy.deepcopy(model.state_dict())
         logger.info(f'***5***--LORA Hessian**1 finish init ')
 
         # --------------------- 数据准备阶段 ---------------------
@@ -2519,26 +3163,52 @@ class UIETrainer(Seq2SeqTrainer):
         if torch.distributed.is_initialized():
             world_size = torch.distributed.get_world_size()
             rank = torch.distributed.get_rank()
-            all_batches = all_batches[rank::world_size]  # 数据分片
+            # all_batches = all_batches[rank::world_size]  # 数据分片
             logger.info(
                 f'***5***--LORA Hessian**2 distribute yes, rank:{rank}, total_batches:{len(all_batches)}')
-
         else:
             logger.info(f'***5***--5-3**4 distribute--no ')
             world_size = 1
             rank = 0
 
         # 批量采样逻辑（改进点3：内存优化）
-        logger.info(
-            f'***5***--5-3**2-1 if  {len(all_batches)} , {max_batches} ')
-        if len(all_batches) > max_batches:
-            if sample_batches:
-                indices = np.random.choice(
-                    len(all_batches), max_batches, replace=False)
-                all_batches = [all_batches[i] for i in indices]
-            else:
-                all_batches = all_batches[:max_batches]
+        # logger.info(
+        #     f'***5***--5-3**2-1 if  {len(all_batches)} , {max_batches} ')
+        # if len(all_batches) > max_batches:
+        #     if sample_batches:
+        #         indices = np.random.choice(
+        #             len(all_batches), max_batches, replace=False)
+        #         all_batches = [all_batches[i] for i in indices]
+        #     else:
+        #         all_batches = all_batches[:max_batches]
 
+        # logger.info(f'***5***--5-3**2 finish load data ')
+        logger.info(f'***5***--5-3**2 finish load data ')
+        def dataloader_stream_sampler(dataloader, max_batches, sample_batches, rank=0, world_size=1):
+            """
+            支持分布式的数据流式 batch 采样器。
+            - dataloader: torch 的数据加载器
+            - max_batches: 最多取几个 batch
+            - sample_batches: True 随机采样，False 顺序取
+            - rank/world_size: 分布式环境下的本地索引
+            """
+            # 把所有batch的index组成一个list
+            indices = list(range(len(dataloader)))
+            if sample_batches:
+                np.random.shuffle(indices)
+            indices = indices[:max_batches]
+
+            # 分布式切分
+            indices = indices[rank::world_size]
+
+            # 只取指定的batch
+            for i, batch in enumerate(dataloader):
+                if i in indices:
+                    yield batch
+                if len(indices) > 0 and i > max(indices):
+                    break
+        logger.info(f'***5***--5-3**2 begin load data ')
+        batch_iterator = dataloader_stream_sampler(dataloader, max_batches, sample_batches, rank=rank, world_size=world_size)
         logger.info(f'***5***--5-3**2 finish load data ')
         # --------------------- 核心算法定义 ---------------------
 
@@ -2632,7 +3302,7 @@ class UIETrainer(Seq2SeqTrainer):
 
                 return hvp_func
 
-            # def lanczos_algorithm(self, hvp_func, dim, order=5, num_splits=4, random_seed=0):
+            def lanczos_algorithm(self, hvp_func, dim, order=5, num_splits=4, random_seed=0):
                 """
                 使用标准 Lanczos 方法计算 Hessian 特征值，并基于 v_chunks 分块计算
                 - hvp_func: Hessian-Vector Product 计算函数
@@ -2723,7 +3393,7 @@ class UIETrainer(Seq2SeqTrainer):
 
                 return tridiag
 
-            def block_lanczos(self, hvp_func, dim, k=10, block_size=4):
+            def block_lanczos(self, hvp_func, dim, k=10, block_size=2):
                 """
                 改进点7：分块Lanczos算法（内存优化）
                 其中超参数 k 是迭代次数，block_size 是块的大小。
@@ -2799,39 +3469,14 @@ class UIETrainer(Seq2SeqTrainer):
         # 只存储初始状态（不带梯度）,用于恢复模型状态
         original_params_to_calculate_hessian = {}
 
-        if Flag_Nlora_newtask and (not Flag_Nlora_full):
-            dom_eigs_Nlora_tasklora = []
-            Nlora_params_tasklora = {}
-            # Nlora_params_lora = {}
-            for name, param in model.named_parameters():
-                if name.find("loranew_") != -1:
-                    # 当使用Nlora 方法时，需要对lora_ 和 loranew_ 进行区分
-                    # 进行扰动只考虑 loranew 的部分，即只更新  与任务有关的那一部分 lora
-                    Nlora_params_tasklora[name] = param
-                    original_params_to_calculate_hessian[name] = param.data.clone(
-                    )
 
-        elif Flag_Nlora_newtask and (Flag_Nlora_full):
-            dom_eigs_Nlora_lora = []
-            Nlora_params_lora = {}
-            for name, param in model.named_parameters():
-                if name.find("loranew_") != -1:
-                    # 当使用Nlora 方法时，需要对lora_ 和 loranew_ 进行区分
-                    Nlora_params_lora[name] = param
-                    original_params_to_calculate_hessian[name] = param.data.clone(
-                    )
-                elif name.find("lora_") != -1:
-                    # 当使用lora 方法时，只有一个 lora的部分 进行扰动只考虑 lora 的部分，即只更新
-                    Nlora_params_lora[name] = param
-                    original_params_to_calculate_hessian[name] = param.data.clone(
-                    )
-
-        elif Flag_lora:
+        if model_type == 'lora':
             dom_eigs_lora = []
             # 获取参数集合（改进点8：动态参数处理）
             lora_params = {}
             for name, param in model.named_parameters():
-                if name.find("lora_") != -1:
+                # 只需要关注哪些需要进行更新的参数
+                if param.requires_grad == True:
                     lora_params[name] = param
                     original_params_to_calculate_hessian[name] = param.data.clone(
                     )
@@ -2840,19 +3485,20 @@ class UIETrainer(Seq2SeqTrainer):
 
         # 分布式通信初始化（改进点9：分布式支持）
 
-        if torch.distributed.is_initialized():
-            logger.info(f'***5***--5-3**4 distribute--yes ')
-            world_size = torch.distributed.get_world_size()
-            rank = torch.distributed.get_rank()
-            all_batches = all_batches[rank::world_size]  # 数据分片
-            logger.info(f'***5***--5-3**4 {len(all_batches)} ')
-        else:
-            logger.info(f'***5***--5-3**4 distribute--no ')
-            world_size = 1
-            rank = 0
+        # if torch.distributed.is_initialized():
+        #     logger.info(f'***5***--5-3**4 distribute--yes ')
+        #     world_size = torch.distributed.get_world_size()
+        #     rank = torch.distributed.get_rank()
+        #     all_batches = all_batches[rank::world_size]  # 数据分片
+        #     logger.info(f'***5***--5-3**4 {len(all_batches)} ')
+        # else:
+        #     logger.info(f'***5***--5-3**4 distribute--no ')
+        #     world_size = 1
+        #     rank = 0
 
         try:
-            for batch in tqdm(all_batches, desc=f"Rank {rank}: Processing"):
+            # for batch in tqdm(all_batches, desc=f"Rank {rank}: Processing"):
+            for batch_idx, batch in enumerate(tqdm(batch_iterator, desc=f"Rank {rank}: Processing")):
                 # 重置模型参数（关键改进点10：消除参数污染）
                 # model.load_state_dict(original_state)
                 # 恢复参数时仅操作需要修改的部分（优化点1）
@@ -2860,75 +3506,8 @@ class UIETrainer(Seq2SeqTrainer):
                     model.state_dict()[name].copy_(
                         original_params_to_calculate_hessian[name])
 
-                # 计算全模型Hessian
-                # logger.info(f'***5***--5-3**5 begin calculate Hessian ')
-                # hvp_full = calculator.compute_hvp(batch)
-                # eigvals = calculator.block_lanczos(hvp_full, dim=sum(p.numel() for p in full_params))
-                # dom_eigs_full.extend(eigvals.tolist())
-
-                # ------------full model paramter analyase Hessien
-                # saved_flags = {}
-                # for name, param in calculator.model.named_parameters():
-                #     # saved_flags保存之前的神经网络的 requires_grad 状态
-                #     saved_flags[name] = param.requires_grad
-                #      # 对全模型 Hessian：临时激活所有参数
-                #     param.requires_grad = True
-
-                # ---根据saved_flags 恢复之前的状态
-                # for name, param in calculator.model.named_parameters():
-                #     param.requires_grad = saved_flags.get(name, param.requires_grad)
-
-                # ------------full model paramter analyase Hessien
-                # hvp_full = compute_batch_hvp(batch, full_params)
-                # eigvals_full = lanczos_iteration(hvp_full, full_params, k=num_iter)
-                # dom_eigs_full.append(eigvals_full.max())
-                # restore_gradients(model, saved_flags)
-
-                # 计算LoRA Hessian
-                if Flag_Nlora_newtask and (not Flag_Nlora_full):
-
-                    logger.info(
-                        f'***5***--5-3**Model device: {next(model.parameters()).device},Batch device: {next(iter(batch.values())).device} ')
-                    logger.info(
-                        f"Type of lora_params: {type(Nlora_params_tasklora)}")
-                    # logger.info(f"Example entry in lora_params: {list(lora_params.items())[:5]}")  # 只打印前5个
-                    logger.info(
-                        f"Type of original_params_to_calculate_hessian: {type(original_params_to_calculate_hessian)}")
-                    # logger.info(f"Example original_params_to_calculate_hessian: {list(original_params_to_calculate_hessian.items())[:5]}")  # 只打印前5个
-
-                    hvp_Nlora_tasklora = calculator.compute_hvp(
-                        batch, Nlora_params_tasklora)
-                    eigvals = calculator.block_lanczos(hvp_Nlora_tasklora, dim=sum(
-                        p.numel() for p in Nlora_params_tasklora.values()))
-                    dom_eigs_Nlora_tasklora.extend(eigvals.tolist())
-
-                    # hvp_Nlora_lora = calculator.compute_hvp(batch,Nlora_params_lora)
-                    # eigvals = calculator.block_lanczos(hvp_Nlora_lora, dim=sum(p.numel() for p in Nlora_params_fulllor))
-                    # dom_eigs_Nlora_lora.extend(eigvals.tolist())
-
-                # 计算LoRA Hessian 这里计算的是所有lora相关部分
-                if Flag_Nlora_newtask and (Flag_Nlora_full):
-
-                    logger.info(
-                        f'***5***--5-3**Model device: {next(model.parameters()).device},Batch device: {next(iter(batch.values())).device} ')
-                    logger.info(
-                        f"Type of lora_params: {type(Nlora_params_tasklora)}")
-                    # logger.info(f"Example entry in lora_params: {list(lora_params.items())[:5]}")  # 只打印前5个
-                    logger.info(
-                        f"Type of original_params_to_calculate_hessian: {type(original_params_to_calculate_hessian)}")
-                    # logger.info(f"Example original_params_to_calculate_hessian: {list(original_params_to_calculate_hessian.items())[:5]}")  # 只打印前5个
-
-                    # hvp_Nlora_tasklora = calculator.compute_hvp(batch,Nlora_params_tasklora)
-                    # eigvals = calculator.block_lanczos(hvp_Nlora_tasklora, dim=sum(p.numel() for p in Nlora_params_tasklora.values()))
-                    # dom_eigs_Nlora_tasklora.extend(eigvals.tolist())
-
-                    hvp_Nlora_lora = calculator.compute_hvp(
-                        batch, Nlora_params_lora)
-                    eigvals = calculator.block_lanczos(hvp_Nlora_lora, dim=sum(
-                        p.numel() for p in Nlora_params_lora.values()))
-                    dom_eigs_Nlora_lora.extend(eigvals.tolist())
-
-                if Flag_lora:
+                
+                if model_type == 'lora':
                     logger.info(
                         f'***5***--5-3**Model device: {next(model.parameters()).device},Batch device: {next(iter(batch.values())).device} ')
                     logger.info(f"Type of lora_params: {type(lora_params)}")
@@ -2940,10 +3519,17 @@ class UIETrainer(Seq2SeqTrainer):
                     hvp_lora = calculator.compute_hvp(batch, lora_params)
                     eigvals = calculator.block_lanczos(
                         hvp_lora, dim=sum(p.numel() for p in lora_params.values()))
-                    dom_eigs_lora.extend(eigvals.tolist())
+                    # eigvals = calculator.lanczos_algorithm(
+                    #     hvp_lora, dim=sum(p.numel() for p in lora_params.values()), order=10, num_splits=4)
+                    # eigvals = calculator.lanczos_algorithm(
+                    #     hvp_lora, dim=sum(p.numel() for p in lora_params.values()), order=10, num_splits=4)
+                    dom_eigs_lora.append(eigvals[-1])  # 或者 eigvals[0]，取决于实现
                     # tridiag = calculator.lanczos_algorithm(hvp_lora, dim=sum(p.numel() for p in lora_params.values()))
                     # dom_eigs_lora.extend(torch.linalg.eigvalsh(tridiag).tolist())
 
+                
+                
+                
                 # 内存清理
                 torch.cuda.empty_cache()
 
@@ -2959,57 +3545,8 @@ class UIETrainer(Seq2SeqTrainer):
         # 分布式结果聚合（改进点11）
         if torch.distributed.is_initialized():
             world_size = torch.distributed.get_world_size()
-            if Flag_Nlora_newtask and (not Flag_Nlora_full):
-                dom_eigs_Nlora_tasklora_tensor = torch.tensor(
-                    dom_eigs_Nlora_tasklora, device=device)
-                # dom_eigs_Nlora_fulllora_tensor = torch.tensor(dom_eigs_Nlora_lora, device=device)
-
-                # 创建接收所有进程数据的列表
-                all_dom_eigs_Nlora_tasklora = [torch.zeros_like(
-                    dom_eigs_Nlora_tasklora_tensor) for _ in range(world_size)]
-                # all_dom_eigs_Nlora_fulllora = [torch.zeros_like(dom_eigs_Nlora_fulllora_tensor) for _ in range(world_size)]
-
-                # 收集所有进程的数据
-                torch.distributed.all_gather(
-                    all_dom_eigs_Nlora_tasklora, dom_eigs_Nlora_tasklora_tensor)
-                # torch.distributed.all_gather(all_dom_eigs_Nlora_fulllora, dom_eigs_Nlora_fulllora_tensor)
-
-                # 拼接所有收集到的数据
-                dom_eigs_Nlora_tasklora = torch.cat(
-                    all_dom_eigs_Nlora_tasklora, dim=0).cpu().numpy().tolist()
-                # dom_eigs_Nlora_fulllora = torch.cat(all_dom_eigs_Nlora_fulllora, dim=0).cpu().numpy().tolist()
-                # 计算统计指标
-                stats_Nlora_tasklora = self._compute_stats(
-                    dom_eigs_Nlora_tasklora)
-                # stats_Nlora_lora = self._compute_stats(dom_eigs_Nlora_fulllora)
-
-            elif Flag_Nlora_newtask and (Flag_Nlora_full):
-                # dom_eigs_Nlora_tasklora_tensor = torch.tensor(dom_eigs_Nlora_tasklora, device=device)
-                dom_eigs_Nlora_fulllora_tensor = torch.tensor(
-                    dom_eigs_Nlora_lora, device=device)
-
-                # 创建接收所有进程数据的列表
-                # all_dom_eigs_Nlora_tasklora = [torch.zeros_like(dom_eigs_Nlora_tasklora_tensor) for _ in range(world_size)]
-                all_dom_eigs_Nlora_fulllora = [torch.zeros_like(
-                    dom_eigs_Nlora_fulllora_tensor) for _ in range(world_size)]
-
-                # 收集所有进程的数据
-                # torch.distributed.all_gather(all_dom_eigs_Nlora_tasklora, dom_eigs_Nlora_tasklora_tensor)
-                torch.distributed.all_gather(
-                    all_dom_eigs_Nlora_fulllora, dom_eigs_Nlora_fulllora_tensor)
-
-                # 拼接所有收集到的数据
-                # dom_eigs_Nlora_tasklora = torch.cat(all_dom_eigs_Nlora_tasklora, dim=0).cpu().numpy().tolist()
-                dom_eigs_Nlora_fulllora = torch.cat(
-                    all_dom_eigs_Nlora_fulllora, dim=0).cpu().numpy().tolist()
-                # 计算统计指标
-                # stats_Nlora_tasklora = self._compute_stats(dom_eigs_Nlora_tasklora)
-                stats_Nlora_lora = self._compute_stats(dom_eigs_Nlora_fulllora)
-
-            elif Flag_lora:
-                # dom_eigs_lora = torch.tensor(dom_eigs_lora, device=device)
-                # torch.distributed.all_reduce(dom_eigs_lora)
-                # dom_eigs_lora = dom_eigs_lora.cpu().numpy().tolist()
+        
+            if model_type == 'lora':
                 dom_eigs_lora_tensor = torch.tensor(
                     dom_eigs_lora, device=device)
 
@@ -3031,36 +3568,7 @@ class UIETrainer(Seq2SeqTrainer):
         # HDF5保存（改进点12：元数据增强）
         # 仅 rank=0 进程保存结果，避免多个进程同时写入 HDF5
         if rank == 0:
-            if Flag_Nlora_newtask and (not Flag_Nlora_full):
-                # with h5py.File(hessian_file_Nlora_full, "w") as hf:
-                #     hf.attrs["created_at"] = datetime.now().isoformat()
-                #     hf.attrs["model_type"] = type(model).__name__
-                #     for k, v in stats_Nlora_lora.items():
-                #         hf.create_dataset(k, data=v)
-                #     hf.create_dataset("dominant_eigs", data=np.array(dom_eigs_Nlora_fulllora))
-
-                with h5py.File(hessian_file_Nlora_tasklora, "w") as hf:
-                    hf.attrs["created_at"] = datetime.now().isoformat()
-                    hf.attrs["model_type"] = type(model).__name__
-                    for k, v in stats_Nlora_tasklora.items():
-                        hf.create_dataset(k, data=v)
-                    hf.create_dataset("dominant_eigs", data=np.array(
-                        dom_eigs_Nlora_tasklora))
-
-                logger.info(f"计算完成，结果保存至 {hessian_file_Nlora_tasklora} 文件")
-
-            elif Flag_Nlora_newtask and (Flag_Nlora_full):
-                with h5py.File(hessian_file_Nlora_fulllora, "w") as hf:
-                    hf.attrs["created_at"] = datetime.now().isoformat()
-                    hf.attrs["model_type"] = type(model).__name__
-                    for k, v in stats_Nlora_tasklora.items():
-                        hf.create_dataset(k, data=v)
-                    hf.create_dataset(
-                        "dominant_eigs", data=np.array(dom_eigs_Nlora_lora))
-
-                logger.info(f"计算完成，结果保存至 {hessian_file_Nlora_fulllora} 文件")
-
-            elif Flag_lora:
+            if model_type == 'lora':
                 with h5py.File(hessian_file_lora, "w") as hf:
                     hf.attrs["created_at"] = datetime.now().isoformat()
                     hf.attrs["model_type"] = type(model).__name__
@@ -3081,3 +3589,190 @@ class UIETrainer(Seq2SeqTrainer):
             torch.distributed.destroy_process_group()  # 释放 NCCL 资源
             logger.info("分布式进程已正确关闭")
         return True
+
+    def compute_task_aware_expected_sharpness(self,
+        eval_dataset,
+        output_dir,
+        distrub_name='originModel',
+        sigma=0.0015, 
+        n_samples=1000, 
+        max_batches=10,
+        sample_batches=False,
+        ):
+        # import torch.distributed
+        """
+        计算 Task-Aware Expected Sharpness，支持精度切换、分布式和自适应 batch。
+        """
+
+        # ========== 初始化与精度设置 ==========
+        logger.info('begin init')
+        args = self.args
+        device = args.device
+
+        # 独立模型副本
+        model = self.model
+        model = self._wrap_model(model, training=False)
+        
+        model = model.to(device=device)
+        model.eval()
+        logger.info(f'***5***--LORA**1 finish init')
+
+        # ========== 数据准备，分布式与采样 ==========
+        logger.info(f'***5***--5-3**2 begin load data')
+        dataloader = self.get_eval_dataloader(eval_dataset)
+        if torch.distributed.is_initialized():
+            world_size = torch.distributed.get_world_size()
+            rank = torch.distributed.get_rank()
+            logger.info(f'***5***--LORA Hessian**2 distribute yes, rank:{rank}, max_batches:{max_batches}')
+        else:
+            logger.info(f'***5***--5-3**4 distribute--no')
+            world_size = 1
+            rank = 0
+
+        # 定义 batch 采样器
+        def dataloader_stream_sampler(dataloader, max_batches, sample_batches, rank=0, world_size=1):
+            indices = list(range(len(dataloader)))
+            if sample_batches:
+                np.random.shuffle(indices)
+            indices = indices[:max_batches]
+            indices = indices[rank::world_size]
+            for i, batch in enumerate(dataloader):
+                if i in indices:
+                    yield batch
+                if len(indices) > 0 and i > max(indices):
+                    break
+
+        
+        batch_iterator = dataloader_stream_sampler(dataloader,max_batches, sample_batches, rank=rank, world_size=world_size)
+
+        # ========== 确定扰动参数集合 ==========
+        original_params_to_perturb = {}
+        logger.info(f"Adding {distrub_name} type nois")
+        for name, param in model.named_parameters():
+            if args.do_train:
+                if distrub_name == 'originModel':
+                    pass
+            else:
+                if distrub_name == 'originModel':
+                    if "loranew_" not in name:
+                        original_params_to_perturb[name] = param.data.clone()
+                        
+                elif distrub_name == 'trainedLoRA':
+                    if "lora_" in name and "loranew_" not in name:
+                        original_params_to_perturb[name] = param.data.clone()
+
+        # ======= 2. 计算 baseline loss（用 prediction_step 统一接口） =======
+        batch_iterator_baseline = dataloader_stream_sampler(
+            dataloader, max_batches, sample_batches, rank=rank, world_size=world_size)
+        baseline_loss_sum = 0.0
+        num_batches = 0
+        with torch.no_grad():
+            for batch in batch_iterator_baseline:
+                batch = {k: v.to(device) for k, v in batch.items()}
+                loss, _, _ = self.prediction_step(
+                    model, batch, prediction_loss_only=True, ignore_keys=None
+                )
+                baseline_loss_sum += loss.item() if hasattr(loss, "item") else float(loss)
+                num_batches += 1
+        baseline_loss = baseline_loss_sum / max(1, num_batches)
+
+        # ======= 3. 累加 expected sharpness（每次扰动都调用 prediction_step） =======
+        sharpness_sum = 0.0
+        sharpness_samples = []
+        sharpness_samples_abs = []
+
+        for i in range(n_samples):
+            perturb_eps = {}
+            with torch.no_grad():
+                for name in original_params_to_perturb:
+                    param = model.state_dict()[name]
+                    epsilon = torch.normal(
+                        mean=0.0, std=sigma, size=param.shape, device=param.device, dtype=param.dtype)
+                    param.add_(epsilon)
+                    perturb_eps[name] = epsilon
+
+            # 采样 batch 重新迭代，loss计算用 prediction_step
+            batch_iterator = dataloader_stream_sampler(
+                dataloader, max_batches, sample_batches, rank=rank, world_size=world_size)
+            perturbed_loss_sum = 0.0
+            num_batches = 0
+            with torch.no_grad():
+                for batch in batch_iterator:
+                    batch = {k: v.to(device) for k, v in batch.items()}
+                    loss, _, _ = self.prediction_step(
+                        model, batch, prediction_loss_only=True, ignore_keys=None
+                    )
+                    perturbed_loss_sum += loss.item() if hasattr(loss, "item") else float(loss)
+                    num_batches += 1
+            perturbed_loss = perturbed_loss_sum / max(1, num_batches)
+
+            # 恢复参数
+            with torch.no_grad():
+                for name in original_params_to_perturb:
+                    param = model.state_dict()[name]
+                    param.sub_(perturb_eps[name])
+
+            this_sharpness = perturbed_loss - baseline_loss
+            sharpness_sum += this_sharpness
+            sharpness_samples.append(this_sharpness)
+            sharpness_samples_abs.append(abs(this_sharpness))
+
+        if torch.distributed.is_initialized():
+            # 所有rank各自的sharpness_samples
+            local_samples = [float(x) for x in sharpness_samples]
+            # 用all_gather_object收集到主进程
+            all_samples = [None for _ in range(world_size)]
+            torch.distributed.all_gather_object(all_samples, local_samples)
+            # 扁平化
+            all_samples = sum(all_samples, [])
+            if rank == 0:
+                sharpness_samples = all_samples
+                sharpness_samples_abs = [abs(x) for x in all_samples]
+        else:
+            if rank == 0:
+                sharpness_samples = [float(x) for x in sharpness_samples]
+                sharpness_samples_abs = [float(x) for x in sharpness_samples_abs]
+
+        # 然后再统一做 mean/max/percentile等统计
+        # ==== 保存结果为 JSON ====
+        # 只主进程保存
+        if rank == 0:
+            expected_sharpness = sharpness_sum / n_samples
+            mean_absolute_sharpness = np.mean(sharpness_samples_abs)
+            max_absolute_sharpness = np.max(sharpness_samples_abs)
+            max_signed_sharpness = np.max(sharpness_samples)
+            min_signed_sharpness = np.min(sharpness_samples)
+            std_signed_sharpness = float(np.std(sharpness_samples))
+            percentile90_abs = float(np.percentile(sharpness_samples_abs, 90))
+            percentile95_abs = float(np.percentile(sharpness_samples_abs, 95))
+
+            logger.info(
+                f"Task-aware Expected Sharpness (sigma={sigma}, n={n_samples}): {expected_sharpness:.6f}, "
+                f"MeanAbs: {mean_absolute_sharpness:.6f}, MaxAbs: {max_absolute_sharpness:.6f}"
+            )
+        
+    
+            result = {
+                "distrub_name": distrub_name,
+                "sigma": sigma,
+                "n_samples": n_samples,
+                "max_batches": max_batches,
+                "expected_sharpness": expected_sharpness,
+                "mean_absolute_sharpness": mean_absolute_sharpness,
+                "max_absolute_sharpness": max_absolute_sharpness,
+                "baseline_loss": baseline_loss,
+                "output_dir": output_dir,
+                "sharpness_samples": [float(x) for x in sharpness_samples],       # 转 float 以便json序列化
+                "sharpness_samples_abs": [float(x) for x in sharpness_samples_abs],
+                "max_signed_sharpness": float(max_signed_sharpness),
+                "min_signed_sharpness": float(min_signed_sharpness),
+                "std_signed_sharpness": std_signed_sharpness,
+                "percentile90_abs": percentile90_abs,
+                "percentile95_abs": percentile95_abs,
+            }
+            json_path = os.path.join(output_dir, f"task_aware_expected_sharpness_{distrub_name}.json")
+            with open(json_path, "w") as f:
+                json.dump(result, f, indent=2)
+            logger.info(f"Sharpness result saved to: {json_path}")
+
+        return expected_sharpness
